@@ -1,0 +1,354 @@
+// Testing a non-WF simulation with single founder population
+
+// ======================================================
+initialize() {
+	initializeSLiMModelType("nonWF");
+	initializeSLiMOptions(keepPedigrees = T);
+	
+	// population parameters
+	defineConstant("p1_K", 1500); // carrying capacity for p1
+	defineConstant("p2_K_init", 500); // initial bottleneck carrying capacity for p2
+	defineConstant("p2_K_max", 1500); // final carrying capacity for p2
+	defineGlobal("p2_K", p2_K_init); // mutable K value over time
+	defineConstant("r", 0.9); // average expected offspring per adult
+
+	
+	// Y-STR mutation model
+	defineConstant("num_STR_loci", 12); // number of STR loci to track
+	defineConstant("muSTR_mean", 0.002); // per-locus mutation rate average
+	defineConstant("muSTR_sd", 0.5); // standard deviation of mutation rate
+	defineConstant("STR_step_prob", 0.5); // equal probability of increasing or decreasing by one repeat
+	defineConstant("STR_init_min", 5); // min starting repeat number
+	defineConstant("STR_init_max", 20); // max starting repeat number
+	defineConstant("STR_min", 5); // absolute min repeat number
+	defineConstant("STR_max", 20); // absolute max repeat number
+	
+	// define major haplogroups and STR profiles
+	defineConstant("numHG", 3);
+	defineConstant("HGnames", c("R1b", "R1a", "I1"));
+		
+	defineConstant("HGbase", matrix(c(13, 24, 14, 11, 13, 29, 13, 11, 14, 15, 12, 12,
+																							12, 25, 16, 10, 12, 31, 11, 12, 15, 14, 10, 11,
+																							13, 23, 15, 10, 13, 28, 12, 13, 15, 14, 11, 12)));
+	print("HGbase");
+	defineConstant("HGfreq", c(0.45, 0.30, 0.25));
+	defineGlobal("IndHG", Dictionary());
+	
+	// per-locus mutation rates drawn from log normal distribution
+	x = rlnorm(num_STR_loci, log(muSTR_mean), muSTR_sd);
+	y = pmax(pmin(x, 0.01), 0.0001);
+	defineConstant("locus_mu", y);
+	cat("Per-locus mutation rates:\n" + paste(locus_mu, sep=", "));
+	
+	// demographics
+	defineConstant("Male", 1);
+	defineConstant("Female", 0);
+	defineConstant("numMig", 300);
+	
+	// initialize storage dictionary for each STR by individual ID
+	defineGlobal("Ystr", Dictionary());
+	
+	// file parameters
+	defineConstant("fname", "simple_sim_g500.csv");
+	defineConstant("workingdir", "/Users/mann/github/2025-modeling_strs");
+}
+
+// ======================================================
+// create original founding population assign Y haplotypes to males
+1 early() {
+	sim.addSubpop("p1", 500); // starting with a small population, growth to carrying capacity
+
+	for (subpop in sim.subpopulations) {
+		for (ind in subpop.individuals) {
+		 // randomly assign males and females
+			ind.tag = (runif(1) < 0.5) ? Male else Female;
+			ind.age = asInteger(runif(1, 15, 45)); // starting population has ages between 15 and 45
+			
+			if (ind.tag == Male) {
+				hg_index = sample(seqLen(numHG), 1, weights = HGfreq);
+				hg_name = HGnames[hg_index];
+				base_hap = HGbase[hg_index,];
+				
+				// add some random variation around the base haplotype
+				hap = asInteger(base_hap + rnorm(num_STR_loci, 0, 0.5)); // most common, no change, common is one repeat, rare 2, very rare 3+
+				// enforce boundaries
+				hap = pmax(STR_min, pmin(STR_max, hap));
+				
+				// add to dictionaries
+				key = asString(ind.pedigreeID);
+				Ystr.setValue(key, hap);
+				IndHG.setValue(key, hg_name);
+			}    
+		}
+	}
+//	print(IndHG);
+}
+
+// ======================================================
+// create founding population that migrates away from the original population
+50 early() { 
+	sim.addSubpop("p2", 0); // starting with zero individuals
+	
+	// migrate individuals from p1 to p2
+	migrants = sample(p1.individuals, numMig);
+	
+	// track male migrants 
+	migrating_males = migrants[migrants.tag == Male];
+	catn("Migrating " + length(migrating_males) + " males to p2");
+	
+	// migrate!
+	for (ind in migrants) {
+		p2.takeMigrants(ind);
+	}
+	
+	// add Ystr entries for males in p2
+	for (ind in migrating_males) {
+		keyM = asString(ind.pedigreeID);
+		hap = Ystr.getValue(keyM);
+		Ystr.setValue(keyM, hap);
+	}
+}
+
+// ======================================================
+// set reproduction with Y chromosome inheritance and STR mutations for p1
+reproduction(p1) {
+	// reproductive age range
+	if (individual.age < 18 | individual.age > 45 ) return; 
+	
+	// find potential mates of opposite sex 
+	potentialMates = subpop.individuals[(subpop.individuals.tag != individual.tag)]; // don't cross breed
+	mate = sample(potentialMates, 1); // pick one random mate
+	
+	// create expected offspring within carrying capacity
+	expectedOffspring = 1 + r * (1 - length(subpop.individuals) / p1_K);
+	
+	// create realized offspring
+	if (expectedOffspring > 0) {
+		realizedOffspring = rpois(n = 1, lambda = expectedOffspring);
+		
+		for (i in seqLen(realizedOffspring)) {
+			if (individual.tag == Male) {
+				offspring = subpop.addCrossed(individual, mate);
+				father = individual; // if current individual is male, assign as father
+		} else {
+				offspring = subpop.addCrossed(mate, individual);
+				father = mate;
+			}
+		// assign sex to offspring using tag
+		offspring.tag = (runif(1) < 0.5) ? Male else Female;
+		// all newborns are zero years old
+		offspring.age = 0;
+	
+	// if baby is male, inherit father's Y-STR haplotype and haplogroup
+	if (offspring.tag == Male) {
+		keyF = asString(father.pedigreeID); // get father's key in the dictionary
+		
+		if (!isNULL(Ystr.getValue(keyF))) { // make sure that the father's key value is present (why wouldn't it be? need to troubleshoot)
+			hap = Ystr.getValue(keyF);
+			hapG = IndHG.getValue(keyF);
+			
+		// apply stepwise mutations to baby's haplotype
+		mutLoci = c();
+		for (l in 0:(num_STR_loci -1)) {
+			if (runif(1) < locus_mu[l]) mutLoci = c(mutLoci, l);
+		}
+			if (!isNULL(mutLoci) & size(mutLoci) > 0) {
+				for ( l in mutLoci) {
+					stepDir = (runif(1) < STR_step_prob) ? 1 else -1;
+					newVal = hap[l] + stepDir;
+				
+					// enforce boundaries
+					if (newVal < STR_min) newVal = STR_min;
+					else if (newVal > STR_max) newVal = STR_max;
+				
+					// assign new mutation to loci
+					hap[l] = newVal;	
+			}
+		}
+
+				// add male offspring to Ystr dictionary
+				keyOff = asString(offspring.pedigreeID);
+				Ystr.setValue(keyOff, hap);
+				IndHG.setValue(keyOff, hapG); // inherit father's haplogroup 
+				}
+			}
+		}
+	}
+}
+
+// ======================================================
+// set reproduction with Y chromosome inheritance and STR mutations for p2
+reproduction(p2) {
+	// reproductive age range
+	if (individual.age < 18 | individual.age > 45) return; 
+	
+	// find potential mates of opposite sex 
+	potentialMates = subpop.individuals[(subpop.individuals.tag != individual.tag)]; // don't cross breed
+	mate = sample(potentialMates, 1); // pick one random mate
+	
+	// gradually increase K for p2 to simulate population expansion
+	p2_K = p2_K_init + asInteger((p2_K_max - p2_K_init) * (community.tick - 50) / 200);
+//	print(p2_K);
+	
+	// create expected offspring within carrying capacity
+	expectedOffspring = 1 + r * (1 - length(subpop.individuals) / p2_K);
+	
+	// create realized offspring
+	if (expectedOffspring > 0) {
+		realizedOffspring = rpois(n = 1, lambda = expectedOffspring);
+		
+		for (i in seqLen(realizedOffspring)) {
+			if (individual.tag == Male) {
+				offspring = subpop.addCrossed(individual, mate);
+				father = individual; // if current individual is male, assign as father
+		} else {
+				offspring = subpop.addCrossed(mate, individual);
+				father = mate;
+			}
+		// assign sex to offspring using tag
+		offspring.tag = (runif(1) < 0.5) ? Male else Female;
+		// all newborns are zero years old
+		offspring.age = 0;
+	
+	// if baby is male, inherit father's Y-STR haplotype and haplogroup
+	if (offspring.tag == Male) {
+		keyF = asString(father.pedigreeID); // get father's key in the dictionary
+		
+		if (!isNULL(Ystr.getValue(keyF))) { // make sure that the father's key value is present (why wouldn't it be? need to troubleshoot)
+			hap = Ystr.getValue(keyF);
+			hapG = IndHG.getValue(keyF);
+			
+		// apply stepwise mutations to baby's haplotype
+		mutLoci = c();
+		for (l in 0:(num_STR_loci -1)) {
+			if (runif(1) < locus_mu[l]) mutLoci = c(mutLoci, l);
+		}
+			if (!isNULL(mutLoci) & size(mutLoci) > 0) {
+				for ( l in mutLoci) {
+					stepDir = (runif(1) < STR_step_prob) ? 1 else -1;
+					newVal = hap[l] + stepDir;
+				
+					// enforce boundaries
+					if (newVal < STR_min) newVal = STR_min;
+					else if (newVal > STR_max) newVal = STR_max;
+				
+					// assign new mutation to loci
+					hap[l] = newVal;	
+			}
+		}
+
+				// add male offspring to Ystr dictionary
+				keyOff = asString(offspring.pedigreeID);
+				Ystr.setValue(keyOff, hap);
+				IndHG.setValue(keyOff, hapG); // inherit father's haplogroup 
+				}
+			}
+		}
+	}
+}
+
+// ======================================================
+// age based survival probability
+early() {
+	for (ind in sim.subpopulations.individuals) {
+		ind.age = ind.age + 1; // age population each tick 
+	}
+	
+	inds_to_kill = c();
+	
+	// age based survival probability
+	if (ind.age < 10) survival_prob = 0.90;
+	else if (ind.age >= 10 & ind.age < 18) survival_prob = 0.98;
+	else if (ind.age >= 18 & ind.age <= 45) survival_prob = 0.99;
+	else if (ind.age > 45 & ind.age <= 60) survival_prob = 0.95;
+	else if (ind.age > 60 & ind.age <= 70) survival_prob = 0.85;
+	else if (ind.age > 70 & ind.age <= 80) survival_prob = 0.60;
+	else if (ind.age > 80) survival_prob = 0.20;
+	
+	if (runif(1) > survival_prob) {
+		if (ind.tag == Male) {
+			key = asString(ind.pedigreeID);
+			if (!isNULL(Ystr.getValue(key))) {
+				Ystr.setValue(key, NULL);
+			}
+		}
+		inds_to_kill = c(inds_to_kill, ind);
+	}
+	
+	// kill individuals who fail survival check
+	if (length(inds_to_kill) > 0) {
+		sim.killIndividuals(inds_to_kill);
+	}
+	
+	// additional carrying capacity based mortality
+	for (subpop in sim.subpopulations) {
+		N = subpop.individualCount;
+		// use K based on population
+		if (subpop.name == "p1") {
+			current_K = p1_K;
+		} else if (subpop.name == "p2") {
+			current_K = p2_K;
+		} else {
+			continue; // placeholder for other pops 
+		}
+		
+		if (N > current_K) {
+			deathProb = (N - current_K) / (N * 3);
+			// massacre!
+			randVal = runif(N);
+			toKill = subpop.individuals[randVal < deathProb];
+			
+			// remove killed off males from dictionary
+			if (length(toKill) > 0) {
+				for (ind in toKill) {
+					if (ind.tag == Male) {
+						key = asString(ind.pedigreeID);
+						if (!isNULL (Ystr.getValue(key))) {
+							Ystr.setValue(key, NULL);
+						}
+					}
+				}
+				sim.killIndividuals(toKill);
+			}
+		}
+	}
+}
+
+// ======================================================
+// get final generation male haplotypes list
+500 late() { 
+	males = p2.individuals[p2.individuals.tag == Male];
+	catn("Final generation: " + sim.cycle + ": " + length(males) + " males total");
+	
+		// populate individual IDs and haplotypes from list of surviving males
+		header = "Sample_ID,Pop";
+		for (l in 1:num_STR_loci) {
+			header = header + ",locus" + l;
+		}
+		header = header + ",HG\n";
+
+	// process all males and their haplotypes with SIM_ prefix using for loop
+	lines = c();
+	for (i in seqAlong(males)) {
+		ind = males[i];
+		key = asString(ind.pedigreeID);
+		hap = Ystr.getValue(key);
+		hg = IndHG.getValue(key);
+		if (!isNULL(hap)) {
+			line = paste0('SIM_', (i+1), ',sim,', paste(hap, sep=','), ',', hg);
+			lines = c(lines, line);
+		}
+	}
+		
+		// remove any NULL entries
+		lines = lines[!sapply(lines, "isNULL(applyValue);")];
+		
+		// combine header and data 
+		file_content = header + paste(lines, sep="\n");
+		
+		// write to file
+		setwd(workingdir);
+		if (!writeFile(fname, file_content))
+			stop("Error writing file");
+		catn("File written to: " + getwd() + "/" + fname);	
+}
