@@ -1,0 +1,815 @@
+/**
+ * =============================================================================
+ * STEPPING STONE RANGE EXPANSION -> ISLAND FOUNDING MODEL
+ * =============================================================================
+ *
+ * PHASE 1 (ticks 1-1000): Panmictic source population (K=10,000), 5 haplogroups
+ * PHASE 2 (tick 1001+):   10x10 stepping-stone lattice, seeded from upper-right
+ *                          (p1), density-dependent expansion toward lower-left
+ * PHASE 3 (triggered):    Island founded from lower-left corner (p100) once it
+ *                          fills, 20 founders grow to K=5,000
+ *
+ * GRID LAYOUT:
+ *   Coordinate system: row 0 = top, col 0 = right
+ *   demeIndex = row * GRID_SIDE + col;  subpopID = demeIndex + 1
+ *
+ *   p1 (index 0) = upper-right corner (origin, seeded first)
+ *   p100 (index 99) = lower-left corner (target, fills last)
+ *
+ *         col 9(left) ... col 0(right)
+ *   row 0 (top):   p10  ...  p1    <-- origin
+ *   row 1:         p20  ...  p11
+ *   ...
+ *   row 9 (bot):   p100 ...  p91
+ *                    ^-- target (island founded from here)
+ *
+ * MIGRATION:
+ *   Moore neighborhood (8 neighbors including diagonals).
+ *   Density-dependent: migrants preferentially move toward emptier neighbors.
+ *   Weight per neighbor = max(0, K - N_neighbor) + epsilon, then normalized.
+ *
+ * Y-STR DATA:
+ *   Stored on Individual objects via setValue()/getValue():
+ *     "hg" -> haplogroup, "ystr" -> haplotype, "patID" -> patriline
+ *   Y-data presence tracked via tagL1 (T = has Y data, F = no Y data)
+ *
+ * USAGE:
+ *   slim stepping_stone_island.slim
+ *   slim -d seed=42 -d "workingdir='/path'" stepping_stone_island.slim
+ *
+ * =============================================================================
+ */
+
+initialize() {
+	initializeSLiMModelType("nonWF");
+	initializeSLiMOptions(keepPedigrees=T);
+	initializeSex("A");  // sexual model; Y-chr tracked via Individual dictionaries
+	
+	// =========================================================================
+	// RANDOM SEED
+	// =========================================================================
+	if (!exists("seed")) seed = rdunif(1, 0, asInteger(2^31) - 1);
+	setSeed(seed);
+	catn("Random seed: " + seed);
+	
+	// =========================================================================
+	// REPLICATE AND OUTPUT DIRECTORY
+	// =========================================================================
+	if (!exists("replicate")) replicate = 1;
+	defineConstant("REP", asInteger(replicate));
+	
+	if (!exists("workingdir"))
+		defineConstant("WORKINGDIR", "./output");
+	else
+		defineConstant("WORKINGDIR", workingdir);
+	
+	// Show where files will actually land
+	catn("Working directory (getwd): " + getwd());
+	
+	// Create output directory if needed
+	if (!fileExists(WORKINGDIR))
+		createDirectory(WORKINGDIR);
+	catn("Output directory: " + WORKINGDIR);
+	
+	// =========================================================================
+	// PHASE 1: SOURCE POPULATION
+	// =========================================================================
+	defineConstant("SOURCE_K", 10000);
+	defineConstant("SOURCE_INIT", 1000);
+	defineConstant("MIXING_GENS", 1000);
+	
+	// =========================================================================
+	// PHASE 2: STEPPING STONE LATTICE
+	// 10x10 grid, 100 demes, K=500 each -> total lattice capacity 50,000
+	// =========================================================================
+	defineConstant("GRID_SIDE", 10);
+	defineConstant("NUM_DEMES", GRID_SIDE * GRID_SIDE);  // 100
+	defineConstant("K_DEME", 500);
+	defineConstant("MIG_PROB", 0.05);      // per-individual migration probability
+	defineConstant("SEED_N", 50);          // individuals seeded into origin deme
+	defineConstant("MIG_EPSILON", 1.0);    // baseline migration weight for full demes
+	
+	// Grid: row 0 = top, col 0 = right
+	// Origin (seeded first):  upper-right = row 0, col 0 = index 0  = p1
+	// Target (fills last):    lower-left  = row 9, col 9 = index 99 = p100
+	defineConstant("ORIGIN_IDX", 0);
+	defineConstant("TARGET_IDX", (GRID_SIDE - 1) * GRID_SIDE + (GRID_SIDE - 1));
+	defineConstant("TARGET_THRESHOLD", asInteger(K_DEME * 0.5));
+	
+	// Island subpop ID
+	defineConstant("ISLAND_ID", NUM_DEMES + 1);  // = 101
+	
+	// =========================================================================
+	// PHASE 3: ISLAND POPULATION
+	// =========================================================================
+	defineConstant("ISLAND_FOUNDERS", 50);
+	defineConstant("ISLAND_K_MAX", 5000);
+	defineConstant("ISLAND_GROWTH_GENS", 1500);
+	defineConstant("ISLAND_POST_FOUND", 1500);
+	
+	// =========================================================================
+	// REPRODUCTION AND AGE
+	// =========================================================================
+	defineConstant("R_OFFSPRING", 5.0);
+	defineConstant("MIN_REPRO_AGE", 18);
+	defineConstant("MAX_REPRO_AGE", 40);
+	defineConstant("MIN_AGE", 15);
+	defineConstant("MAX_AGE", 60);
+	
+	// (Density regulation uses population-level fitnessScaling = min(1, K / (N * meanSurv)),
+	//  factoring in age-based mortality so populations equilibrate around K.)
+	
+	// =========================================================================
+	// Y-STR MUTATION MODEL
+	// 12 loci with fixed per-locus rates (per generation)
+	// Stepwise: equal probability +1/-1, bounds [5, 35]
+	//
+	// Loci: DYS19, DYS385a, DYS385b, DYS388, DYS389I, DYS389II,
+	//        DYS390, DYS391, DYS392, DYS393, DYS426, DYS438
+	// =========================================================================
+	defineConstant("NUM_STR", 12);
+	defineConstant("LOCUS_MU", c(
+		0.0025,   // DYS19
+		0.0021,   // DYS385a
+		0.0021,   // DYS385b
+		0.001,    // DYS388
+		0.0024,   // DYS389I
+		0.0035,   // DYS389II
+		0.0025,   // DYS390
+		0.0028,   // DYS391
+		0.0007,   // DYS392
+		0.0008,   // DYS393
+		0.0007,   // DYS426
+		0.0007    // DYS438
+	));
+	defineConstant("STEP_PROB", 0.5);
+	defineConstant("STR_MIN", 5);
+	defineConstant("STR_MAX", 35);
+	
+	catn("Per-locus mu: " + paste(format("%.4f", LOCUS_MU), sep=", "));
+	
+	// =========================================================================
+	// FIVE HAPLOGROUPS
+	// =========================================================================
+	defineConstant("NUM_HG", 5);
+	defineConstant("HG_NAMES", c("HG_A", "HG_B", "HG_C", "HG_D", "HG_E"));
+	defineConstant("HG_BASE", rbind(
+		//     DYS19 385a 385b 388  389I 389II 390  391  392  393  426  438
+		c(     13,   24,  14,  11,  13,  29,   13,  11,  14,  15,  12,  12),  // HG_A (R1a-like)
+		c(     12,   25,  16,  10,  12,  31,   11,  12,  15,  14,  10,  11),  // HG_B (R1b-like)
+		c(     14,   22,  11,  14,  14,  27,   15,  10,  11,  16,  13,  14),  // HG_C (I1-like)
+		c(     15,   20,  18,  13,  11,  33,   12,  13,  17,  12,  14,   9),  // HG_D (J1-like)
+		c(     11,   27,  13,   9,  15,  26,   14,  14,  12,  18,  11,  15)   // HG_E (E1b-like)
+	));
+	defineConstant("HG_FREQ", c(0.20, 0.20, 0.20, 0.20, 0.20));
+	
+	// =========================================================================
+	// PATRILINE COUNTER AND PHASE FLAGS
+	// =========================================================================
+	defineGlobal("nextPatID", 1);
+	defineGlobal("latticeCreated", F);
+	defineGlobal("islandFounded", F);
+	defineGlobal("islandFoundTick", -1);
+	
+	// =========================================================================
+	// MINIMAL GENETICS (placeholder)
+	// =========================================================================
+	initializeMutationType("m1", 0.5, "f", 0.0);
+	m1.convertToSubstitution = T;
+	initializeGenomicElementType("g1", m1, 1.0);
+	initializeGenomicElement(g1, 0, 999);
+	initializeMutationRate(0);
+	initializeRecombinationRate(0);
+	
+	catn("\n=== STEPPING STONE -> ISLAND MODEL ===");
+	catn("Source K=" + SOURCE_K + " | Mixing=" + MIXING_GENS + " gens");
+	catn("Lattice " + GRID_SIDE + "x" + GRID_SIDE + " (" + NUM_DEMES + " demes) | K/deme=" + K_DEME);
+	catn("Origin=p" + (ORIGIN_IDX+1) + " (upper-right) | Target=p" + (TARGET_IDX+1) + " (lower-left)");
+	catn("Migration: Moore neighborhood, density-weighted, prob=" + MIG_PROB);
+	catn("Island: " + ISLAND_FOUNDERS + " founders -> K=" + ISLAND_K_MAX);
+	catn("Density regulation: pop.fitnessScaling = min(1, K / (N * meanSurv))");
+	catn("Haplogroups: " + paste(HG_NAMES, sep=", "));
+	catn("Rep=" + REP + " Seed=" + seed);
+	catn("========================================\n");
+}
+
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+// Store Y-chr data on a male Individual (also sets tagL1 flag)
+function (void) setYdata(object<Individual>$ ind, string$ hg, integer haplotype, integer$ patID) {
+	ind.setValue("hg", hg);
+	ind.setValue("ystr", haplotype);
+	ind.setValue("patID", patID);
+	ind.tagL1 = T;  // flag: this individual has Y data
+}
+
+// Stepwise mutation of Y-STR haplotype (vectorized)
+function (integer) mutateSTR(integer parentHap) {
+	mutates = runif(NUM_STR) < LOCUS_MU;
+	if (!any(mutates)) return parentHap;
+	steps = ifelse(runif(NUM_STR) < STEP_PROB, 1, -1);
+	newHap = parentHap + asInteger(mutates) * steps;
+	return asInteger(pmax(STR_MIN, pmin(STR_MAX, newHap)));
+}
+
+// Grid coord from 0-based deme index -> c(col, row)
+// row 0 = top, col 0 = right
+function (integer) demeToCoord(integer$ demeIdx) {
+	row = asInteger(floor(demeIdx / GRID_SIDE));
+	col = demeIdx - row * GRID_SIDE;
+	return c(col, row);
+}
+
+// 0-based deme index from (col, row)
+function (integer$) coordToDeme(integer$ col, integer$ row) {
+	return row * GRID_SIDE + col;
+}
+
+// Moore neighborhood: up to 8 neighbors (cardinal + diagonal)
+function (integer) getNeighbors(integer$ demeIdx) {
+	coords = demeToCoord(demeIdx);
+	col = coords[0];
+	row = coords[1];
+	neighbors = integer(0);
+	
+	for (dr in c(-1, 0, 1)) {
+		for (dc in c(-1, 0, 1)) {
+			if (dr == 0 & dc == 0) next;  // skip self
+			nr = row + dr;
+			nc = col + dc;
+			if (nr >= 0 & nr < GRID_SIDE & nc >= 0 & nc < GRID_SIDE)
+				neighbors = c(neighbors, coordToDeme(nc, nr));
+		}
+	}
+	return neighbors;
+}
+
+// Carrying capacity for a subpopulation
+function (integer$) getLocalK(object<Subpopulation>$ pop) {
+	if (pop.id == 0)
+		return SOURCE_K;
+	if (pop.id == ISLAND_ID) {
+		if (islandFounded) {
+			gens = community.tick - islandFoundTick;
+			frac = min(1.0, gens / asFloat(ISLAND_GROWTH_GENS));
+			return asInteger(ISLAND_FOUNDERS + (ISLAND_K_MAX - ISLAND_FOUNDERS) * frac);
+		}
+		return ISLAND_K_MAX;
+	}
+	return K_DEME;
+}
+
+// Y-chromosome inheritance: father -> male offspring
+function (void) inheritYchr(object<Individual>$ offspring, object<Individual>$ father) {
+	if (offspring.sex == "M") {
+		if (father.tagL1) {  // FIX: use tagL1 flag instead of dictionary key scan
+			fHG = father.getValue("hg");
+			fHap = father.getValue("ystr");
+			fPat = father.getValue("patID");
+			setYdata(offspring, fHG, mutateSTR(fHap), fPat);
+		}
+	}
+}
+
+// Print haplogroup summary for a set of males (vectorized)
+function (void) printHGsummary(object<Individual> males) {
+	nMales = size(males);
+	if (nMales == 0) { catn("  No males"); return; }
+	
+	// Filter to males with Y data using tagL1
+	yMales = males[males.tagL1 == T];
+	if (size(yMales) == 0) { catn("  No males with Y data"); return; }
+	
+	// Fetch all haplogroups in one batch via setValuesVectorized/getValue loop
+	hgs = string(size(yMales));
+	for (i in seqLen(size(yMales)))
+		hgs[i] = yMales[i].getValue("hg");
+	
+	for (h in seqLen(NUM_HG)) {
+		count = sum(hgs == HG_NAMES[h]);
+		pct = asFloat(count) / asFloat(nMales) * 100.0;
+		catn("  " + HG_NAMES[h] + ": " + count + " (" + format("%.1f", pct) + "%)");
+	}
+}
+
+// Write Y-STR CSV for all males in a population (batched file writing)
+function (void) outputPopulation(object<Subpopulation>$ pop, string$ label) {
+	tick = community.tick;
+	fname = WORKINGDIR + "/" + label + "_rep" + REP + "_seed" + getSeed() + ".csv";
+	
+	header = "replicate,tick,population,pedigreeID,sex,age,haplogroup,patrilineID";
+	for (loc in seqLen(NUM_STR))
+		header = header + ",locus" + (loc + 1);
+	
+	males = pop.individuals[pop.individuals.sex == "M"];
+	// Filter to males with Y data using tagL1
+	yMales = males[males.tagL1 == T];
+	
+	// Build all lines, then write once
+	lines = c(header);
+	for (m in yMales) {
+		hg = m.getValue("hg");
+		hap = m.getValue("ystr");
+		pat = m.getValue("patID");
+		line = REP + "," + tick + "," + label + "," +
+		       m.pedigreeID + "," + m.sex + "," + m.age + "," +
+		       hg + "," + pat;
+		for (loc in seqLen(NUM_STR))
+			line = line + "," + hap[loc];
+		lines = c(lines, line);
+	}
+	writeFile(fname, lines, append=F);
+	catn("  Output: " + fname + " (" + size(yMales) + " males)");
+}
+
+// Write Y-STR CSV for a given vector of males (for sampled subsets)
+function (void) outputMales(object<Individual> males, string$ label) {
+	tick = community.tick;
+	fname = WORKINGDIR + "/" + label + "_rep" + REP + "_seed" + getSeed() + ".csv";
+	
+	header = "replicate,tick,population,pedigreeID,sex,age,haplogroup,patrilineID";
+	for (loc in seqLen(NUM_STR))
+		header = header + ",locus" + (loc + 1);
+	
+	// Filter to males with Y data using tagL1
+	yMales = males[males.tagL1 == T];
+	
+	// Build all lines, then write once
+	lines = c(header);
+	for (m in yMales) {
+		hg = m.getValue("hg");
+		hap = m.getValue("ystr");
+		pat = m.getValue("patID");
+		line = REP + "," + tick + "," + label + "," +
+		       m.pedigreeID + "," + m.sex + "," + m.age + "," +
+		       hg + "," + pat;
+		for (loc in seqLen(NUM_STR))
+			line = line + "," + hap[loc];
+		lines = c(lines, line);
+	}
+	writeFile(fname, lines, append=F);
+	catn("  Output: " + fname + " (" + size(yMales) + " males)");
+}
+
+// Output key lattice positions
+function (void) outputLatticeCorners(void) {
+	positions = c(
+		ORIGIN_IDX,                                                    // upper-right (p1)
+		TARGET_IDX,                                                    // lower-left (p100)
+		coordToDeme(asInteger(GRID_SIDE/2), asInteger(GRID_SIDE/2)),   // center
+		coordToDeme(GRID_SIDE-1, 0),                                   // upper-left
+		coordToDeme(0, GRID_SIDE-1)                                    // lower-right
+	);
+	posNames = c("lattice_UR_origin", "lattice_LL_target",
+	             "lattice_center", "lattice_UL", "lattice_LR");
+	
+	allSP = sim.subpopulations;
+	for (i in seqLen(size(positions))) {
+		demeID = positions[i] + 1;
+		matches = allSP[allSP.id == demeID];
+		if (size(matches) > 0)
+			if (matches[0].individualCount > 0)
+				outputPopulation(matches[0], posNames[i]);
+	}
+}
+
+
+// =============================================================================
+// REPRODUCTION: SINGLE CALLBACK FOR ALL POPULATIONS
+// Using NULL avoids dangling reference when p0 is removed at tick 1001.
+// Handles source (p0), lattice (p1-p100), and island (p101).
+// FIX: Uses sampleIndividuals() for idiomatic, optimized mate selection.
+// =============================================================================
+reproduction(NULL, "M") {
+	if (individual.age < MIN_REPRO_AGE | individual.age > MAX_REPRO_AGE) return;
+	
+	// Find eligible female mate using sampleIndividuals (optimized, no manual filter)
+	mate = subpop.sampleIndividuals(1, sex="F",
+		minAge=MIN_REPRO_AGE, maxAge=MAX_REPRO_AGE);
+	if (size(mate) == 0) return;
+	
+	// Carrying capacity for density-scaled reproduction
+	localK = getLocalK(subpop);
+	scaledR = R_OFFSPRING * (1.0 - subpop.individualCount / (2.0 * localK));
+	scaledR = max(0.0, scaledR);
+	nOff = rpois(1, scaledR);
+	
+	for (i in seqLen(nOff)) {
+		offspring = subpop.addCrossed(mate, individual);  // female first, male second
+		inheritYchr(offspring, individual);
+	}
+}
+
+
+// =============================================================================
+// TICK 1: CREATE SOURCE POPULATION
+// =============================================================================
+1 early() {
+	sim.addSubpop("p0", SOURCE_INIT);
+	
+	for (ind in p0.individuals)
+		ind.age = rdunif(1, MIN_AGE, MAX_AGE);
+	
+	// Initialize tagL1 = F for all individuals (no Y data yet)
+	p0.individuals.tagL1 = F;
+	
+	males = p0.individuals[p0.individuals.sex == "M"];
+	catn("Initial males: " + size(males));
+	
+	for (m in males) {
+		// Random haplogroup assignment
+		hgDraw = runif(1);
+		cumFreq = 0.0;
+		hgIdx = NUM_HG - 1;
+		for (h in seqLen(NUM_HG)) {
+			cumFreq = cumFreq + HG_FREQ[h];
+			if (hgDraw < cumFreq) { hgIdx = h; break; }
+		}
+		
+		// Base haplotype + stochastic noise
+		// FIX: removed redundant asInteger() — HG_BASE is already integer
+		baseHap = HG_BASE[hgIdx, ];
+		noise = asInteger(round(rnorm(NUM_STR, 0, 0.8)));
+		initHap = asInteger(pmax(STR_MIN, pmin(STR_MAX, baseHap + noise)));
+		
+		patID = nextPatID;
+		defineGlobal("nextPatID", nextPatID + 1);
+		setYdata(m, HG_NAMES[hgIdx], initHap, patID);
+	}
+	
+	catn("Source initialized: " + p0.individualCount + " inds, " + size(males) + " males");
+}
+
+
+// =============================================================================
+// DEBUG: LIFECYCLE STAGE TRACKING (first few post-lattice ticks)
+// nonWF order: first() -> reproduction -> early() -> survival -> late()
+// =============================================================================
+first() {
+	if (latticeCreated & community.tick <= MIXING_GENS + 3) {
+		totalInds = 0;
+		for (pop in sim.subpopulations)
+			totalInds = totalInds + pop.individualCount;
+		catn("  [first] tick " + community.tick + " totalInds=" + totalInds);
+	}
+}
+
+
+// =============================================================================
+// EVERY TICK: AGE + DENSITY-DEPENDENT SURVIVAL
+// FIX: Vectorized age-mortality (no per-individual loop).
+// FIX: Clamped ageFrac >= 0 so juveniles (age < MIN_AGE) don't get
+//      fitnessScaling > 1.0.
+// FIX: Density regulation compensates for mean age mortality so populations
+//      equilibrate around K rather than below it.
+// =============================================================================
+early() {
+	// Debug: confirm early() fires after lattice creation
+	if (latticeCreated & community.tick <= MIXING_GENS + 3) {
+		totalInds = 0;
+		for (pop in sim.subpopulations)
+			totalInds = totalInds + pop.individualCount;
+		catn("  [early] tick " + community.tick + " totalInds=" + totalInds);
+	}
+	
+	for (pop in sim.subpopulations) {
+		inds = pop.individuals;
+		if (size(inds) == 0) next;
+		
+		// ---- AGE-DEPENDENT MORTALITY (vectorized) ----
+		// Layered on top of density regulation. Young adults have high
+		// survival; older individuals have lower survival.
+		// Age <= 15: baseSurv = 0.95  (juveniles clamped, no >1.0 values)
+		// Age 40: baseSurv = 0.70
+		// Age 60: baseSurv = 0.50
+		// Above MAX_AGE: guaranteed death
+		ages = inds.age;
+		ageFrac = pmax(0.0, (ages - MIN_AGE) / asFloat(MAX_AGE - MIN_AGE));
+		survival = pmax(0.05, 0.95 - 0.45 * ageFrac);
+		survival[ages > MAX_AGE] = 0.0;
+		inds.fitnessScaling = survival;
+		
+		// ---- DENSITY REGULATION (compensated for age mortality) ----
+		// pop.fitnessScaling = min(1.0, K / (N * meanSurv))
+		// Without the meanSurv correction, populations equilibrate below K
+		// because age mortality stacks on top of density regulation.
+		// (See SLiM manual section 15.2 for this standard correction.)
+		localK = getLocalK(pop);
+		meanSurv = mean(survival);
+		if (meanSurv > 0.0)
+			pop.fitnessScaling = min(1.0, localK / (asFloat(size(inds)) * meanSurv));
+		else
+			pop.fitnessScaling = 1.0;  // all about to die from age anyway
+	}
+}
+
+
+// =============================================================================
+// TICK 500: STATUS
+// =============================================================================
+500 late() {
+	males = p0.individuals[p0.individuals.sex == "M"];
+	catn("Tick 500: pop=" + p0.individualCount + " males=" + size(males));
+	printHGsummary(males);
+}
+
+
+// =============================================================================
+// TICK 1000: END PHASE 1
+// =============================================================================
+1000 late() {
+	males = p0.individuals[p0.individuals.sex == "M"];
+	catn("\n=== END PHASE 1 ===");
+	catn("Tick 1000: pop=" + p0.individualCount + " males=" + size(males));
+	printHGsummary(males);
+	catn("");
+}
+
+
+// =============================================================================
+// TICK 1001: CREATE LATTICE, SEED ORIGIN, REMOVE SOURCE
+// =============================================================================
+1001 late() {
+	catn("\n=== PHASE 2: LATTICE CREATION ===");
+	catn("Tick " + community.tick);
+	
+	outputPopulation(p0, "source_premigration");
+	
+	// Create 100 empty demes (p1-p100)
+	for (i in 1:NUM_DEMES)
+		sim.addSubpop(i, 0);
+	catn("Created " + NUM_DEMES + " demes (p1-p" + NUM_DEMES + ")");
+	
+	// Seed origin (upper-right = p1) with REPRODUCTIVE-AGE ADULTS
+	// Using minAge/maxAge ensures all founders can immediately reproduce.
+	// This is also biologically realistic: colonists are typically adults.
+	originID = ORIGIN_IDX + 1;
+	originDeme = sim.subpopulations[sim.subpopulations.id == originID][0];
+	
+	nSeedMales = asInteger(SEED_N / 2);
+	nSeedFemales = SEED_N - nSeedMales;
+	
+	seedMales = p0.sampleIndividuals(nSeedMales, sex="M",
+		minAge=MIN_REPRO_AGE, maxAge=MAX_REPRO_AGE);
+	seedFemales = p0.sampleIndividuals(nSeedFemales, sex="F",
+		minAge=MIN_REPRO_AGE, maxAge=MAX_REPRO_AGE);
+	
+	originDeme.takeMigrants(seedMales);
+	originDeme.takeMigrants(seedFemales);
+	
+	catn("Seeded p" + originID + " (upper-right) with " + originDeme.individualCount + " inds");
+	// FIX: Guard against empty seed vectors that would crash min()/max()
+	if (size(seedMales) > 0)
+		catn("  " + size(seedMales) + " males (ages " + min(seedMales.age) + "-" + max(seedMales.age) + ")");
+	else
+		catn("  WARNING: 0 seed males found!");
+	if (size(seedFemales) > 0)
+		catn("  " + size(seedFemales) + " females (ages " + min(seedFemales.age) + "-" + max(seedFemales.age) + ")");
+	else
+		catn("  WARNING: 0 seed females found!");
+	
+	allSeedMales = originDeme.individuals[originDeme.individuals.sex == "M"];
+	printHGsummary(allSeedMales);
+	
+	// Remove source population -- safe because reproduction callback uses NULL
+	p0.removeSubpopulation();
+	catn("p0 removed");
+	
+	defineGlobal("latticeCreated", T);
+	catn("=== EXPANSION BEGINS ===\n");
+}
+
+
+// =============================================================================
+// EVERY TICK LATE: MIGRATION, MONITORING, ISLAND FOUNDING, TERMINATION
+// Uses an always-on late() callback (no tick range) to ensure SLiM's event
+// scheduler keeps the simulation running. Guards prevent execution before
+// the lattice exists or on the lattice-creation tick itself.
+// =============================================================================
+late() {
+	if (!latticeCreated) return;
+	tick = community.tick;
+	if (tick <= MIXING_GENS + 1) return;  // skip tick 1001 (lattice just created)
+	allSP = sim.subpopulations;
+	
+	if (tick <= MIXING_GENS + 3)
+		catn("  [late] tick " + tick + " pops=" + size(allSP));
+	
+	// =====================================================================
+	// PART 1: DENSITY-DEPENDENT MIGRATION (Moore neighborhood)
+	//
+	// TWO layers of density dependence:
+	//
+	// (A) EMIGRATION DECISION: Migration probability scales with source crowding.
+	//     effMigProb = MIG_PROB * max(0, (N/K) - 0.5) / 0.5
+	//     Below 50% capacity: nobody leaves (building up local population).
+	//     At capacity (N=K): full MIG_PROB applies.
+	//     Above capacity: migration exceeds MIG_PROB (pressure to leave).
+	//     This creates a dense wave front that fills before expanding.
+	//
+	// (B) DESTINATION CHOICE: Migrants preferentially move toward emptier neighbors.
+	//     weight_i = max(0, K - N_neighbor) + epsilon
+	//     Empty neighbors are strongly preferred over full ones.
+	// =====================================================================
+	
+	latticePops = allSP[allSP.id >= 1 & allSP.id <= NUM_DEMES];
+	
+	// ---- Build subpopulation lookup table (avoids repeated linear scans) ----
+	// spLookup[i] stores the subpopulation object for ID = i+1 (0-indexed by demeIdx)
+	// We use a Dictionary keyed by string ID for O(1) lookup.
+	spLookup = Dictionary();
+	for (pop in latticePops)
+		spLookup.setValue(asString(pop.id), pop);
+	
+	// Initialize migration tags (tagL0 = F means "hasn't moved yet")
+	for (pop in latticePops)
+		if (pop.individualCount > 0)
+			pop.individuals.tagL0 = F;
+	
+	for (pop in latticePops) {
+		if (pop.individualCount == 0) next;
+		
+		demeIdx = pop.id - 1;
+		neighbors = getNeighbors(demeIdx);
+		if (size(neighbors) == 0) next;
+		
+		// (A) Density-dependent emigration probability
+		// No migration below 50% K; ramps linearly to MIG_PROB at K;
+		// continues to increase above K (overflow pressure)
+		densityFrac = pop.individualCount / asFloat(K_DEME);
+		effMigProb = MIG_PROB * max(0.0, (densityFrac - 0.5) / 0.5);
+		if (effMigProb <= 0.0) next;  // deme too sparse, nobody leaves
+		
+		// Only individuals that haven't already moved this tick
+		inds = pop.individuals[pop.individuals.tagL0 == F];
+		if (size(inds) == 0) next;
+		
+		// Select migrants using effective (density-scaled) probability
+		migFlags = (runif(size(inds)) < effMigProb);
+		migrants = inds[migFlags];
+		if (size(migrants) == 0) next;
+		
+		// Tag so they won't be selected again from their destination deme
+		migrants.tagL0 = T;
+		
+		// (B) Density-dependent destination weighting
+		// weight = max(0, K - N_neighbor) + epsilon
+		// Empty deme (N=0): weight ~ K = 100
+		// Full deme (N=K):  weight ~ epsilon = 1
+		// FIX: Use Dictionary lookup instead of repeated linear scans
+		nNeighbors = size(neighbors);
+		weights = float(nNeighbors);
+		for (ni in seqLen(nNeighbors)) {
+			nID = neighbors[ni] + 1;  // subpop ID
+			nCount = spLookup.getValue(asString(nID)).individualCount;
+			weights[ni] = asFloat(max(0, K_DEME - nCount)) + MIG_EPSILON;
+		}
+		
+		// Normalize weights to probabilities
+		totalW = sum(weights);
+		probs = weights / totalW;
+		
+		// FIX: Vectorized destination assignment — one sample() call,
+		// then batch takeMigrants() by destination (at most 8 calls)
+		nMig = size(migrants);
+		destIndices = sample(neighbors, nMig, replace=T, weights=probs);
+		for (ni in seqLen(nNeighbors)) {
+			batch = migrants[destIndices == neighbors[ni]];
+			if (size(batch) == 0) next;
+			nID = neighbors[ni] + 1;
+			spLookup.getValue(asString(nID)).takeMigrants(batch);
+		}
+	}
+	
+	// =====================================================================
+	// PART 2: MONITORING
+	// Detailed for first 20 lattice ticks, then every 50 ticks
+	// =====================================================================
+	
+	latticeAge = tick - MIXING_GENS - 1;  // ticks since lattice created
+	doReport = (latticeAge <= 20) | (tick % 50 == 0);
+	
+	if (doReport) {
+		totalPop = 0;
+		nOccupied = 0;
+		allSP = sim.subpopulations;
+		for (pop in allSP) {
+			if (pop.id >= 1 & pop.id <= NUM_DEMES) {
+				n = pop.individualCount;
+				if (n > 0) { nOccupied = nOccupied + 1; totalPop = totalPop + n; }
+			}
+		}
+		targetID = TARGET_IDX + 1;
+		targetPops = allSP[allSP.id == targetID];
+		targetN = 0;
+		if (size(targetPops) > 0) targetN = targetPops[0].individualCount;
+		
+		// Origin deme status
+		originPops = allSP[allSP.id == (ORIGIN_IDX + 1)];
+		originN = 0;
+		if (size(originPops) > 0) originN = originPops[0].individualCount;
+		
+		catn("Tick " + tick + " (lattice+" + latticeAge + "): occupied=" + nOccupied +
+		     "/" + NUM_DEMES + " total=" + totalPop +
+		     " origin(p" + (ORIGIN_IDX+1) + ")=" + originN +
+		     " target(p" + targetID + ")=" + targetN);
+	}
+	
+	// =====================================================================
+	// PART 3: ISLAND FOUNDING
+	// =====================================================================
+	
+	if (!islandFounded) {
+		targetID = TARGET_IDX + 1;
+		allSP = sim.subpopulations;
+		targetPops = allSP[allSP.id == targetID];
+		if (size(targetPops) > 0) {
+			targetDeme = targetPops[0];
+			if (targetDeme.individualCount >= TARGET_THRESHOLD) {
+				catn("\n=== PHASE 3: ISLAND FOUNDING ===");
+				catn("Tick " + tick + ": target p" + targetID + " has " +
+				     targetDeme.individualCount + " (threshold=" + TARGET_THRESHOLD + ")");
+				
+				// Output haplotypes from key demes at founding
+				catn("--- Founding-time deme snapshots ---");
+				allSPnow = sim.subpopulations;
+				for (snapID in c(1, 55, 100)) {
+					snapPops = allSPnow[allSPnow.id == snapID];
+					if (size(snapPops) > 0 & snapPops[0].individualCount > 0)
+						outputPopulation(snapPops[0], "founding_p" + snapID);
+				}
+				
+				sim.addSubpop(ISLAND_ID, 0);
+				founders = targetDeme.sampleIndividuals(ISLAND_FOUNDERS);
+				islandPop = sim.subpopulations[sim.subpopulations.id == ISLAND_ID][0];
+				islandPop.takeMigrants(founders);
+				
+				catn("Island p" + ISLAND_ID + ": " + islandPop.individualCount + " founders");
+				founderMales = islandPop.individuals[islandPop.individuals.sex == "M"];
+				catn("  Males: " + size(founderMales));
+				printHGsummary(founderMales);
+				
+				defineGlobal("islandFounded", T);
+				defineGlobal("islandFoundTick", tick);
+				catn("=== ISLAND GROWTH BEGINS ===\n");
+			}
+		}
+	}
+	
+	// =====================================================================
+	// PART 4: COMPLETION CHECK
+	// =====================================================================
+	
+	if (islandFounded) {
+		if ((tick - islandFoundTick) >= ISLAND_POST_FOUND) {
+			catn("\n=== COMPLETE ===");
+			catn("Tick " + tick + ": " + ISLAND_POST_FOUND + " gens post-founding");
+			
+			islandPops = sim.subpopulations[sim.subpopulations.id == ISLAND_ID];
+			if (size(islandPops) > 0) {
+				islandPop = islandPops[0];
+				islandMales = islandPop.individuals[islandPop.individuals.sex == "M"];
+				islandYMales = islandMales[islandMales.tagL1 == T];
+				catn("Island p" + ISLAND_ID + ": " + islandPop.individualCount +
+				     " total, " + size(islandYMales) + " males with Y data");
+				catn("--- Final island haplogroup frequencies ---");
+				printHGsummary(islandYMales);
+				
+				// Random sample of 100 males (or all if fewer than 100)
+				sampleN = min(100, size(islandYMales));
+				sampledMales = sample(islandYMales, sampleN);
+				outputMales(sampledMales, "island_sample100");
+			}
+			outputLatticeCorners();
+			
+			catn("Output: " + WORKINGDIR);
+			sim.simulationFinished();
+		}
+	}
+	
+	// =====================================================================
+	// PART 5: SAFETY VALVE
+	// =====================================================================
+	
+	if (latticeCreated & !islandFounded & (tick - MIXING_GENS > 2000)) {
+		catn("\nWARNING: Target not filled after 2000 lattice gens.");
+		outputLatticeCorners();
+		sim.simulationFinished();
+	}
+}
+
+
+// =============================================================================
+// FAR-FUTURE SCHEDULED EVENT
+// SLiM determines simulation duration from the maximum tick in any scheduled
+// script block. Without this, the simulation ends after tick 1001 (our last
+// explicitly scheduled block). This event ensures SLiM keeps running.
+// Normal termination happens via sim.simulationFinished() in the late() block.
+// =============================================================================
+10000 late() {
+	catn("ERROR: Reached tick 10000 without completing. Forcing termination.");
+	sim.simulationFinished();
+}
